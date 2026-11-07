@@ -1,0 +1,28 @@
+{
+  "name": "cocos-mcp-2x",
+  "version": "0.8.0",
+  "description": "Cocos Creator 2.x MCP server —— 让 AI 直接读写项目文件、搜索代码、查询场景树、解析脚本组件、读取编辑器日志、写入场景节点",
+  "author": "unfinishWork",
+  "main": "main.js",
+  "scene-script": "scene.js",
+  "main-menu": {
+    "扩展/Cocos MCP 2.x/状态与端口": {
+      "message": "cocos-mcp-2x:status"
+    },
+    "扩展/Cocos MCP 2.x/列出已打开项目": {
+      "message": "cocos-mcp-2x:projects"
+    },
+    "扩展/Cocos MCP 2.x/重启服务": {
+      "message": "cocos-mcp-2x:restart"
+    },
+    "扩展/Cocos MCP 2.x/开启中继服务": {
+      "message": "cocos-mcp-2x:hub-start"
+    },
+    "扩展/Cocos MCP 2.x/停止中继服务": {
+      "message": "cocos-mcp-2x:hub-stop"
+    },
+    "扩展/Cocos MCP 2.x/切换目标项目": {
+      "message": "cocos-mcp-2x:next-target"
+    }
+  }
+}
