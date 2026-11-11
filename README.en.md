@@ -800,4 +800,4 @@ chain and reports `__hops` and the final `__hint`. Cycles are capped at 4 hops.
 
 ---
 
-MIT License · author unfinishWork
+MIT License · author UC-RX0

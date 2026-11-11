@@ -1504,7 +1504,7 @@ function toolPreviewCommand(args) {
                     action: action,
                     error: '等指令结果超时（' + timeout + 'ms）。' +
                         '预览页可能没连上 —— 先 preview_control {action:"bridge"} 看 connected。',
-                    pendingCommands: bridgeState.commands.length,
+                    pendingCommands: bridgePendingCount(),
                     connected: bridgeState.connected
                 });
                 return;
@@ -3275,26 +3275,23 @@ function installPreviewBridge() {
         return { installed: false, reason: '读不到 bridge.js：' + (e.message || e) };
     }
 
-    // 注入配置里的端口：优先用**中继端口**。
+    // 注入配置里的端口：**直连本扩展实例的 HTTP 端口**。
     //
-    // 为什么不用扩展自己的端口：扩展端口会变（编辑器重启、多开时按启动顺序分配）。
-    // 页面里的配置一旦写死，扩展一重启就指向一个死端口 ——
-    // 桥接静默断掉，不报任何错。
-    // 中继端口是固定的（mcp.json 就指着它），中继再把 /bridge/* 转发给目标实例。
+    // 预览页是 http://localhost:7457，bridge.js 请求 127.0.0.1:<port> 属跨域。
+    // 本实例上面的 /bridge/* 已统一带 CORS 头并处理 OPTIONS，直连能正常工作；
+    // 而中继 25800 没有 CORS 头，写它的端口会让每次轮询都 preflight 失败，
+    // 浏览器控制台被 CORS / ERR_FAILED 刷屏，游戏自己的报错反而看不到。
     //
-    // 中继没跑的时候才退回扩展自己的端口（单实例直连也能用）。
-    var port = 0;
+    // 端口是每次安装注入中间件时动态取的：扩展重启后预览页重载会重新注入，
+    // 不存在「写死端口指向死地址」的问题。中继仍作为 AI 客户端的固定入口，
+    // 只在扩展端口还没确定时兜底。
+    var port = listeningPort || 0;
     var usingHub = false;
-    try {
-        // 中继活着就用中继端口（固定），否则退回扩展自己的端口
-        var hubInfo = readHubState();
-        if (hubInfo && hubInfo.port) {
-            port = hubInfo.port;
-            usingHub = true;
-        }
-    } catch (e) { /* 忽略 */ }
     if (!port) {
-        port = listeningPort || 0;
+        try {
+            var hubInfo = readHubState();
+            if (hubInfo && hubInfo.port) { port = hubInfo.port; usingHub = true; }
+        } catch (e) { /* 忽略 */ }
     }
     if (!port) {
         return { installed: false, reason: '扩展端口还没确定（listeningPort=0）' };
@@ -3410,6 +3407,36 @@ function openPreviewWindow(url, forceReload) {
         return { opened: false, reason: 'electron.BrowserWindow 不可用' };
     }
 
+    // 先清掉同端口的其它预览窗口。
+    // 扩展热重载后 previewWindow 变量归零，但旧窗口还在 —— 再 start 就会开出第二个页面，
+    // 两个页面轮流上报、轮流领指令，会互相把对方的指令判死，看着就是"连上了但不执行"。
+    //
+    // 只按 URL 找不够：新窗口在加载完之前 webContents.getURL() 是空串，
+    // 会被当成"不匹配"漏掉。所以自己创建的窗口记进 global（跨扩展重载还在），按登记表清。
+    global.__mcpPreviewWindows = global.__mcpPreviewWindows || [];
+    var stray = 0;
+    for (var gi = 0; gi < global.__mcpPreviewWindows.length; gi++) {
+        var gw = global.__mcpPreviewWindows[gi];
+        if (gw === previewWindow) continue;
+        try { if (!gw.isDestroyed()) { gw.destroy(); stray++; } } catch (e) { /* 忽略 */ }
+    }
+    global.__mcpPreviewWindows = previewWindow && !previewWindow.isDestroyed() ? [previewWindow] : [];
+
+    try {
+        var portTag = url.replace(/\/+$/, '');
+        var all = electron.BrowserWindow.getAllWindows();
+        for (var i = 0; i < all.length; i++) {
+            var w = all[i];
+            if (w === previewWindow) continue;
+            var wu = '';
+            try { wu = w.webContents.getURL(); } catch (e) { wu = ''; }
+            if (!wu) continue;
+            if (wu === portTag || wu.indexOf(portTag + '/') === 0) {
+                try { w.destroy(); stray++; } catch (e) { /* 忽略 */ }
+            }
+        }
+    } catch (e) { /* 忽略 */ }
+
     // 已经开着一个就复用，别开一堆
     if (previewWindow && !previewWindow.isDestroyed()) {
         try {
@@ -3423,7 +3450,7 @@ function openPreviewWindow(url, forceReload) {
                 previewWindow.loadURL(url);
             }
         } catch (e) { /* 忽略 */ }
-        return { opened: true, reused: true, url: url, reloaded: !!forceReload };
+        return { opened: true, reused: true, url: url, reloaded: !!forceReload, strayClosed: stray };
     }
 
     try {
@@ -3452,10 +3479,12 @@ function openPreviewWindow(url, forceReload) {
         previewWindow = null;
     });
 
+    global.__mcpPreviewWindows.push(previewWindow);
+
     // 调试出口：让外部能问窗口里的状态（页面有没有加载完、bridge 装上没有）
     global.__mcpPreviewWindow = previewWindow;
 
-    return { opened: true, reused: false, url: url };
+    return { opened: true, reused: false, url: url, strayClosed: stray };
 }
 
 function closePreviewWindow() {
@@ -3498,9 +3527,12 @@ function toolPreviewControl(args) {
                 };
                 // 服务已在跑，但 bridge 可能还没注入（比如扩展是后启动的）
                 var inj = installPreviewBridge();
+                // 已连上就别再重载：一次 reloadIgnoringCache 会把预览页整个重跑一遍，
+                // 加载几十秒，而且会重放历史命令
+                var forceReload = !bridgeState.connected;
                 var win = args.open === false
                     ? { opened: false, reason: 'open=false' }
-                    : openPreviewWindow(curUrl, true);
+                    : openPreviewWindow(curUrl, forceReload);
                 return {
                     running: true,
                     port: curPort,
@@ -3509,7 +3541,12 @@ function toolPreviewControl(args) {
                     bridge: inj,
                     window: win,
                     note: '预览服务已经在跑，复用它（没有新开端口）；' +
-                        '已强制重载预览页以装入 bridge。预览页是引擎即时编译的，不需要 build。'
+                        (forceReload
+                            ? 'bridge 还没连上，已重载预览页以装入桥。'
+                            : (args.open === false
+                                ? 'open=false，没动窗口。'
+                                : (win.reused ? 'bridge 已连接，页面保持不动。' : '已打开预览窗口。'))) +
+                        '预览页是引擎即时编译的，不需要 build。'
                 };
             }
             return startPreviewServer(ps).then(function (out) {
@@ -3594,7 +3631,8 @@ function toolPreviewControl(args) {
             url: report ? report.url : null,
             logTotal: bridgeState.logSeq,
             errorTotal: bridgeState.errors.length,
-            pendingCommands: bridgeState.commands.length,
+            pendingCommands: bridgePendingCount(),
+            pageId: bridgeState.pageId,
             hasWindow: !!(previewWindow && !previewWindow.isDestroyed()),
             hint: !bridgeState.connected
                 ? '预览页还没连上。确认 preview_control start 成功、窗口已打开、' +
@@ -4576,12 +4614,12 @@ function findAuditProbeFiles() {
                     if (ri >= 0 && arr[ri] && arr[ri]._name) out.prefabRoot = arr[ri]._name;
                 } catch (e2) { /* 忽略 */ }
             } else if (!out.png && /\.png$/i.test(es[i].name)) {
-                out.png = rel; found++;
-                // 顺带拿它的主 uuid
-                try {
-                    var m = JSON.parse(fs.readFileSync(p + '.meta', 'utf8'));
-                    if (m && m.uuid) out.pngUuid = m.uuid;
-                } catch (e2) { /* 忽略 */ }
+                // 必须带一份可读的 .meta 才算数：编辑器重新导入的瞬间 meta 会短暂缺失，
+                // 挑中这种图会让后面 prefab / asset 那几个用例全部跳过（假失败）。
+                var pm = null;
+                try { pm = JSON.parse(fs.readFileSync(p + '.meta', 'utf8')); } catch (e3) { pm = null; }
+                if (!pm || !pm.uuid) continue;
+                out.png = rel; out.pngUuid = pm.uuid; found++;
             }
         }
     })(assetsDir, 0);
@@ -4633,7 +4671,9 @@ function toolMcpVerifyAll(args) {
         try {
             fs.mkdirSync(probeDirAbs, { recursive: true });
             // 复制 png 和它的 meta（meta 里的 uuid 必须换新的，否则和原图冲突）
-            var srcMeta = JSON.parse(fs.readFileSync(pa.png + '.meta', 'utf8'));
+            // pa.png 是项目相对路径，读文件必须拼上项目根 —— 编辑器进程的 cwd 不是项目根，
+            // 直接 readFileSync('assets/...') 在别的项目里会 ENOENT。
+            var srcMeta = JSON.parse(fs.readFileSync(path.join(root, pa.png) + '.meta', 'utf8'));
             var copyName = 'probe.png';
             var copyAbs = path.join(probeDirAbs, copyName);
             fs.copyFileSync(path.join(root, pa.png), copyAbs);
@@ -4670,20 +4710,46 @@ function toolMcpVerifyAll(args) {
         }
     } catch (e) { sceneCopyReady = false; }
 
+    // 自检用例的「父节点」也不能写死 Canvas：不同项目的场景根结构不一样
+    // （有的根下直接是 UI 容器，有的套了一层 Bootstrap）。
+    // 优先找真挂了 cc.Canvas 的节点（那就是 UI 根），找不到再退回根下第一个子节点。
+    var selParent = 'Canvas';
+    try {
+        if (sceneCopyReady) {
+            var selArr = sceneparse.loadSerialized(sceneCopyAbs);
+            var selRoot = sceneparse.findRootForEdit(selArr).rootId;
+            if (selRoot >= 0) {
+                var selTree = sceneparse.expandNode(selArr, selRoot, 0, 3, null);
+                var selQueue = (selTree.children || []).slice();
+                if (selQueue.length) selParent = selQueue[0].name;
+                while (selQueue.length) {
+                    var selNode = selQueue.shift();
+                    var hitCanvas = (selNode.components || []).some(function (c) { return c.type === 'cc.Canvas'; });
+                    if (hitCanvas) { selParent = selNode.name; break; }
+                    (selNode.children || []).forEach(function (kc) { selQueue.push(kc); });
+                }
+            } else {
+                selParent = 'Scene';
+            }
+        }
+    } catch (e) {
+        // 场景副本解析不了就让用例继续跑默认值，自检本身不该因为这个挂掉
+    }
+
     var cases = [
         ['write_file', { path: tmpRel + '/demo.ts', content: 'export const x = 1;\n' }],
         ['edit_file', { path: tmpRel + '/demo.ts', oldText: 'x = 1', newText: 'x = 2' }],
         ['refresh_assets', { path: 'db://assets/' }],
         ['scene_create', { path: tmpRel + '/verify_' + STAMP + '.fire' }],
-        ['prefab', { cmd: 'create', from: 'node', node: 'Canvas', prefab: tmpRel + '/out_' + STAMP + '.prefab', scene: sceneCopyRel }],
-        ['scene_edit', { cmd: 'add-node', from: 'prefab', prefab: tmpRel + '/out_' + STAMP + '.prefab', parent: 'Canvas', name: STAMP + '_pf', path: sceneCopyRel }],
-        ['scene_edit', { cmd: 'add-node', parent: 'Canvas', name: STAMP, path: sceneCopyRel }],
+        ['prefab', { cmd: 'create', from: 'node', node: selParent, prefab: tmpRel + '/out_' + STAMP + '.prefab', scene: sceneCopyRel }],
+        ['scene_edit', { cmd: 'add-node', from: 'prefab', prefab: tmpRel + '/out_' + STAMP + '.prefab', parent: selParent, name: STAMP + '_pf', path: sceneCopyRel }],
+        ['scene_edit', { cmd: 'add-node', parent: selParent, name: STAMP, path: sceneCopyRel }],
         ['scene_edit', { cmd: 'set-props', node: STAMP, position: { x: 1, y: 2, z: 3 }, path: sceneCopyRel }],
-        ['scene_edit', { cmd: 'move-node', node: STAMP, newParent: 'Canvas', path: sceneCopyRel }],
+        ['scene_edit', { cmd: 'move-node', node: STAMP, newParent: selParent, path: sceneCopyRel }],
         ['scene_edit', { cmd: 'remove-node', node: STAMP, path: sceneCopyRel }],
-        ['scene_edit', { cmd: 'add-component', node: 'Canvas', type: 'cc.Label', path: sceneCopyRel }],
-        ['scene_edit', { cmd: 'remove-component', node: 'Canvas', type: 'cc.Label', path: sceneCopyRel }],
-        ['scene_edit', { cmd: 'set-component-props', node: 'Canvas', type: 'cc.Canvas', props: { _priority: 1 }, path: sceneCopyRel }],
+        ['scene_edit', { cmd: 'add-component', node: selParent, type: 'cc.Label', path: sceneCopyRel }],
+        ['scene_edit', { cmd: 'remove-component', node: selParent, type: 'cc.Label', path: sceneCopyRel }],
+        ['scene_edit', { cmd: 'set-component-props', node: selParent, type: 'cc.Canvas', props: { _priority: 1 }, path: sceneCopyRel }],
         // 从零造预制体：建在探测目录里，跑完整个目录一起删
         ['prefab', probeFileRel ? {
             cmd: 'create',
@@ -4709,8 +4775,8 @@ function toolMcpVerifyAll(args) {
         ['preview', { cmd: 'control', action: 'status' }],
         ['run_script', { code: 'return 1 + 1;' }],
         // 旧名转发链也要真跑一遍：v0.8.0 的旧名（1 跳）和 v0.4.0 的旧名（2 跳）
-        ['scene_add_node', { parent: 'Canvas', name: STAMP + '_legacy', path: sceneCopyRel }],
-        ['prefab_instantiate', { prefab: tmpRel + '/out_' + STAMP + '.prefab', parent: 'Canvas', name: STAMP + '_legacy2', path: sceneCopyRel }],
+        ['scene_add_node', { parent: selParent, name: STAMP + '_legacy', path: sceneCopyRel }],
+        ['prefab_instantiate', { prefab: tmpRel + '/out_' + STAMP + '.prefab', parent: selParent, name: STAMP + '_legacy2', path: sceneCopyRel }],
         // 下面两个是故意用不存在的名字/平台 —— 报错是预期结果，任何环境下都该失败
         ['set_target_project', { name: '__不存在的项目__' }, true],
         ['project_settings', { cmd: 'set', settings: { 'design-resolution-width': 750 } }],
@@ -5381,6 +5447,9 @@ var bridgeState = {
     connected: false,
     lastAt: null,
     lastReport: null,
+    pageId: null,        // 当前页面的实例 id（bridge 每次加载生成），换了就说明页面重载过
+    primaryPage: null,   // 唯一允许领指令的页面（防止两个预览页抢指令）
+    primaryPollAt: 0,    // 主页面最后一次来领指令的时间
     logs: [],            // 带序号的 console 日志
     logSeq: 0,
     commands: [],        // 待执行队列
@@ -5392,6 +5461,45 @@ var bridgeState = {
     seenLogKeyList: [],
     byeAt: null
 };
+
+/**
+ * 还没回结果的指令条数。
+ * 注意不能直接报 commands.length —— 那个是历史累计，只会越涨越多，看着像永远有积压。
+ */
+function bridgePendingCount() {
+    var n = 0;
+    for (var i = 0; i < bridgeState.commands.length; i++) {
+        if (!bridgeState.results[bridgeState.commands[i].id]) n++;
+    }
+    return n;
+}
+
+/**
+ * 把队列里还没回结果的指令判死。
+ *
+ * 页面重载/关闭后它们永远不会被执行了，不判死的话调用方要干等满自己的 timeout。
+ * bye 请求在 unload 时经常发不出去，所以页面换实例（pageId 变了）时也要走一遍。
+ */
+function bridgeFailPending(reason) {
+    var n = 0;
+    for (var i = 0; i < bridgeState.commands.length; i++) {
+        var c = bridgeState.commands[i];
+        if (bridgeState.results[c.id]) continue;
+        bridgeState.results[c.id] = {
+            id: c.id, seq: c.seq, ok: false,
+            error: reason + '（指令作废，未执行完）'
+        };
+        bridgeState.resultOrder.push(c.id);
+        n++;
+    }
+    if (bridgeState.resultOrder.length > 200) {
+        var drop = bridgeState.resultOrder.length - 200;
+        for (var k = 0; k < drop; k++) {
+            delete bridgeState.results[bridgeState.resultOrder.shift()];
+        }
+    }
+    return n;
+}
 
 // 保留多少条日志和结果
 var BRIDGE_MAX_LOGS = 500;
@@ -6519,6 +6627,23 @@ function toolSceneCapture(args) {
 
     var out = { clean: clean };
 
+    // 传 .prefab 时自动让编辑器进入该预制体的编辑态，再截图。
+    // 以前 path 只对 .fire 做校验、.prefab 一律跳过，逐页换皮验收得手工双击，
+    // 太慢。把切换收进本工具（不新增工具、不新增参数）：显式传 path 就是要看它。
+    // 正确的 IPC 是 scene:enter-prefab-edit-mode（不是 enter-prefab-mode），参数是 .prefab 的 uuid。
+    var wantPrefab = !!(args.path && String(args.path).toLowerCase().slice(-7) === '.prefab');
+    var openPrefab = function () {
+        if (!wantPrefab || !wantUuid) return Promise.resolve();
+        try {
+            Editor.Ipc.sendToPanel('scene', 'scene:enter-prefab-edit-mode', wantUuid);
+        } catch (e) {
+            throw new Error('切换预制体失败：' + (e && e.message ? e.message : e));
+        }
+        out.openedPrefab = args.path;
+        // 场景面板要重新加载节点树，等它渲染完，否则截到上一个 prefab
+        return new Promise(function (res) { setTimeout(res, 1500); });
+    };
+
     var hideDeco = function () {
         if (!clean) return Promise.resolve();
 
@@ -6670,7 +6795,7 @@ function toolSceneCapture(args) {
         });
     };
 
-    return checkTarget().then(hideDeco).then(doCapture).then(function (res) {
+    return checkTarget().then(openPrefab).then(hideDeco).then(doCapture).then(function (res) {
         return showDeco().then(function () { return res; });
     }, function (err) {
         return showDeco().then(function () { throw err; });
@@ -7604,6 +7729,33 @@ function startServer(port, attempt) {
     }
 
     var s = http.createServer(function (req, res) {
+        // ── Web 预览桥接的 CORS ──────────────────────────────────────
+        // 预览页是 http://localhost:7457，bridge.js 请求 127.0.0.1:<port>，
+        // 属于跨域。以前 /bridge/* 的响应没带 CORS 头、也不处理 OPTIONS，
+        // 浏览器每次轮询都 preflight 失败并自动打印 CORS + ERR_FAILED，
+        // 把游戏自己的报错全刷没了。这里统一拦一层，所有 /bridge/* 都带上。
+        if (req.url && req.url.indexOf('/bridge/') === 0) {
+            var CORS_HEADERS = {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type',
+                'Access-Control-Max-Age': '86400'
+            };
+            var origWH = res.writeHead;
+            res.writeHead = function (status, headers) {
+                var h = headers || {};
+                for (var k in CORS_HEADERS) {
+                    if (Object.prototype.hasOwnProperty.call(CORS_HEADERS, k) && !h[k]) h[k] = CORS_HEADERS[k];
+                }
+                return origWH.call(this, status, h);
+            };
+            if (req.method === 'OPTIONS') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+        }
+
         // 场景进程回传专用端点。
         // 场景窗口是渲染进程，sendToMain 不保证路由到我们（实测会丢），
         // 但只要能 require('http')，直接 POST 回自己的服务是最可靠的一条路。
@@ -7625,9 +7777,19 @@ function startServer(port, attempt) {
                 var rep = null;
                 try { rep = JSON.parse(brBody); } catch (e) { /* 忽略 */ }
                 if (rep) {
+                    var prevAt = bridgeState.lastAt;
                     bridgeState.connected = true;
                     bridgeState.lastAt = Date.now();
                     bridgeState.lastReport = rep;
+                    // 换了页面实例，且上一页已经"安静"了一段时间 —— 才算真的重载了，
+                    // 把上一页没执行完的指令判死。
+                    // 加这个安静判定是因为偶尔会同时存在两个预览页，它们轮流上报会让
+                    // pageId 来回跳；不加判定就会把正在正常执行的指令误杀。
+                    if (rep.pageId && bridgeState.pageId && rep.pageId !== bridgeState.pageId) {
+                        var quietMs = prevAt ? (bridgeState.lastAt - prevAt) : 999999;
+                        if (quietMs > 3000) bridgeFailPending('预览页已重载');
+                    }
+                    if (rep.pageId) bridgeState.pageId = rep.pageId;
                     if (rep.logs && rep.logs.length) {
                         for (var li = 0; li < rep.logs.length; li++) {
                             bridgePushLog(rep.logs[li]);
@@ -7642,8 +7804,63 @@ function startServer(port, attempt) {
 
         if (req.method === 'GET' && req.url && req.url.indexOf('/bridge/commands') === 0) {
             var since = 0;
-            var m = /since=(\d+)/.exec(req.url);
-            if (m) since = parseInt(m[1], 10) || 0;
+            var m = /since=(-?\d+)/.exec(req.url);
+            if (m) since = parseInt(m[1], 10);
+
+            // 只允许一个页面领指令。
+            // 同时开着两个预览页时（扩展重载后旧窗口还在），两个页面都会轮询，
+            // 同一个指令被 A 领走后 B 永远等不到 —— 表现就是"命令随机超时"。
+            // 规则：第一个来问的当主页面；主页面超过 3 秒没来问（说明它重载/关了），
+            // 就把主页面让给当前这个。
+            var pm = /[?&]page=([^&]+)/.exec(req.url);
+            var page = pm ? decodeURIComponent(pm[1]) : null;
+            if (!page) {
+                // 没带 page 的是旧版 bridge（扩展重载前加载的页面）。
+                // 一律不给指令，让它们静默 —— 否则它们会跟新页面抢
+                var maxSeqL = 0;
+                for (var li2 = 0; li2 < bridgeState.commands.length; li2++) {
+                    var lsq = bridgeState.commands[li2].seq || 0;
+                    if (lsq > maxSeqL) maxSeqL = lsq;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ commands: [], cursor: maxSeqL }));
+                return;
+            }
+            if (page) {
+                if (!bridgeState.primaryPage ||
+                    (page !== bridgeState.primaryPage &&
+                        Date.now() - bridgeState.primaryPollAt > 3000)) {
+                    bridgeState.primaryPage = page;
+                    bridgeState.primaryPollAt = Date.now();
+                }
+                if (page === bridgeState.primaryPage) {
+                    bridgeState.primaryPollAt = Date.now();
+                } else {
+                    // 副页面：什么都不给，只把位点推到最新，免得它一直问同一批
+                    var maxSeqX = 0;
+                    for (var xi = 0; xi < bridgeState.commands.length; xi++) {
+                        var xsq = bridgeState.commands[xi].seq || 0;
+                        if (xsq > maxSeqX) maxSeqX = xsq;
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ commands: [], cursor: maxSeqX }));
+                    return;
+                }
+            }
+
+            if (!(since >= 0)) {
+                // since 为负 = 页面刚加载，只要位点、不要历史。
+                // 不清这个的话，整页重载后新页面会从 seq 0 开始拉，把这次会话里发过的
+                // 每条命令（包括几十秒的脚本）全部重放一遍 —— 页面直接卡死，心跳也断。
+                var maxSeq = 0;
+                for (var ci = 0; ci < bridgeState.commands.length; ci++) {
+                    var csq = bridgeState.commands[ci].seq || 0;
+                    if (csq > maxSeq) maxSeq = csq;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ commands: [], cursor: maxSeq }));
+                return;
+            }
             var pending = bridgeState.commands.filter(function (c) { return c.seq > since; });
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ commands: pending }));
@@ -7676,6 +7893,8 @@ function startServer(port, attempt) {
         if (req.method === 'POST' && req.url && req.url.indexOf('/bridge/bye') === 0) {
             bridgeState.connected = false;
             bridgeState.byeAt = Date.now();
+            // 页面关掉了，队列里没回结果的指令不会再执行 —— 判死，别让调用方干等
+            bridgeFailPending('预览页已关闭');
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end('{"ok":true}');
             return;

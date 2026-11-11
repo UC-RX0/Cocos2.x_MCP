@@ -17,6 +17,13 @@
 (function () {
     'use strict';
 
+    // 测试时想看游戏自己的 console：URL 加 ?mcp=off 就完全不装桥。
+    // 不劫持 console、不轮询、不发任何请求，控制台一条 MCP 相关信息都不会有。
+    // 和 build 产物注入脚本（inject-runtime.js）的 ?mcp=off 约定保持一致。
+    try {
+        if (/(?:^|[?&])mcp=off(?:&|$)/.test(window.location.search || '')) return;
+    } catch (e) { /* 忽略 */ }
+
     var CFG = window.__MCP_BRIDGE_CONFIG__ || {};
     var PORT = CFG.port || 0;
     var INTERVAL = CFG.interval || 1500;
@@ -34,7 +41,11 @@
     var lastReport = null;
     var lastSentLogIdx = 0;
     var cmdBusy = false;
-    var cmdCursor = 0;          // 已经处理过的指令序号
+    var cmdBusyAt = 0;          // 本次轮询的发起时间，用来给 cmdBusy 兜底解卡
+    var cmdCursor = -1;         // 已处理到的指令序号；-1 = 刚加载，先跟服务端对齐位点，不重放历史
+    // 每次页面加载生成一个新 id：服务端靠它识别"换页了"，
+    // 把上一页没执行完的指令判死（bye 请求在 unload 时经常发不出去）
+    var PAGE_ID = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
     var stopped = false;
 
     // ---------------------------------------------------------------- 工具
@@ -70,7 +81,14 @@
         }
         try {
             x.open(method, url, true);
-            x.setRequestHeader('Content-Type', 'application/json');
+            // 只在上报（POST）时带一个「简单请求」允许的 Content-Type。
+            // 以前连 GET 轮询都设 application/json，每次都触发 OPTIONS 预检；
+            // 现在 GET 是纯简单请求，POST 用 text/plain 也是简单请求
+            // （服务端按 JSON.parse 解析 body，不认 Content-Type），
+            // 既省掉预检往返，也不会在控制台留下网络噪音。
+            if (body !== null && body !== undefined) {
+                x.setRequestHeader('Content-Type', 'text/plain;charset=UTF-8');
+            }
             x.onreadystatechange = function () {
                 if (x.readyState !== 4) return;
                 if (x.status >= 200 && x.status < 300) {
@@ -165,6 +183,18 @@
     }
 
     function nodeName(n) { return n && n.name ? n.name : '?'; }
+
+    // cc.Scene 根节点没有 active 属性，直接读会让引擎打
+    // 「"active" is not defined in the Scene, it is only defined in normal nodes.」
+    // 上报每 1.5s 跑一次，这条警告就会持续刷屏，盖住游戏自己的日志。
+    function safeActive(node, ccm) {
+        try {
+            if (!node) return true;
+            var sc = ccm && ccm.director ? ccm.director.getScene() : null;
+            if (node === sc || node._isScene) return true;
+            return node.active !== false;
+        } catch (e) { return true; }
+    }
 
     function compsOf(node, ccm) {
         var comps = null;
@@ -269,7 +299,7 @@
             count++;
             var out = {
                 name: nodeName(node),
-                active: node.active !== false,
+                active: safeActive(node, ccm),
                 position: { x: node.position.x, y: node.position.y, z: node.position.z },
                 scale: { x: node.scaleX, y: node.scaleY, z: node.scaleZ },
                 components: [],
@@ -308,6 +338,7 @@
         var rep = {
             bridge: 1,
             project: CFG.project || null,
+            pageId: PAGE_ID,
             at: now(),
             url: window.location.href,
             frame: 0,
@@ -441,7 +472,7 @@
             if (!node) return { ok: false, error: '找不到节点：' + cmd.path };
             var out = {
                 name: node.name,
-                active: node.active !== false,
+                active: safeActive(node, ccm),
                 position: { x: node.position.x, y: node.position.y, z: node.position.z },
                 components: []
             };
@@ -1013,9 +1044,16 @@
     }
 
     function pollCommands() {
-        if (stopped || cmdBusy) return;
+        if (stopped) return;
+        // 上一次轮询没回来就别叠着发，但要给个上限：
+        // 页面重载 / 服务端重启会把在途连接晾死，回调永不触发，
+        // 那样 cmdBusy 会一直 true —— 轮询永久停摆，命令全堆在服务端，表现就是"连着但不执行"
+        if (cmdBusy) {
+            if (Date.now() - cmdBusyAt < 5000) return;
+        }
         cmdBusy = true;
-        xhr('GET', '/bridge/commands?since=' + cmdCursor, null, function (err, data) {
+        cmdBusyAt = Date.now();
+        xhr('GET', '/bridge/commands?since=' + cmdCursor + '&page=' + encodeURIComponent(PAGE_ID), null, function (err, data) {
             cmdBusy = false;
             if (err || !data) return;
             var list = data.commands || [];
@@ -1023,6 +1061,11 @@
                 var cmd = list[i];
                 cmdCursor = Math.max(cmdCursor, cmd.seq || 0);
                 reportResult(cmd, null);
+            }
+            // 首次拉取（cursor 还是 -1）：服务端只回一个当前位点，
+            // 历史命令一律不重放 —— 否则整页重载会把这次会话发过的所有脚本重跑一遍
+            if (cmdCursor < 0) {
+                cmdCursor = (typeof data.cursor === 'number' ? data.cursor : 0);
             }
         });
     }
